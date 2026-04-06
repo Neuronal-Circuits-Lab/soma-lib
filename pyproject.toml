@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "soma-connect"
+version = "0.1.0"
+description = "Python client for the soma connect Supabase database"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "supabase>=2.4.0",
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "pydantic>=2.5.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-mock>=3.12.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/soma_connect"]
