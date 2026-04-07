@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 from typing import Sequence
 
 import numpy as np
@@ -8,11 +10,36 @@ from .exceptions import TensorShapeError
 from .models import Tensor
 
 
-def rows_to_matrix(
+# ---------------------------------------------------------------------------
+# Serialisation helpers
+# ---------------------------------------------------------------------------
+
+def _encode_firing_rates(arr: np.ndarray) -> str:
+    """Serialise a 1-D float32 array to a base64 string for DB storage."""
+    buf = io.BytesIO()
+    np.save(buf, arr.astype(np.float32))
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _decode_firing_rates(blob: str | bytes) -> np.ndarray:
+    """Deserialise a base64 string (or raw bytes) back to a 1-D float32 array."""
+    raw = base64.b64decode(blob) if isinstance(blob, (str, bytes)) else blob
+    return np.load(io.BytesIO(raw))
+
+
+# ---------------------------------------------------------------------------
+# rows_to_tensor  (was rows_to_matrix)
+# ---------------------------------------------------------------------------
+
+def rows_to_tensor(
     rows: list[Tensor],
 ) -> tuple[np.ndarray, list[int], list[str], list[int]]:
     """
-    Convert a flat list of Tensor rows into a 3-D numpy array.
+    Convert a flat list of Tensor rows into a 4-D numpy array.
+
+    Each row stores the full firing-rate timeseries for one
+    (neuron, stimuli, trial) combination as a base64-encoded blob.
+    The timepoints dimension is reconstructed by decoding that blob.
 
     Parameters
     ----------
@@ -21,8 +48,9 @@ def rows_to_matrix(
 
     Returns
     -------
-    matrix : np.ndarray, shape (n_neurons, n_stimuli, n_trials), dtype float64
-        Firing rates. Cells without data are filled with NaN.
+    tensor : np.ndarray, shape (n_neurons, n_stimuli, n_trials, n_timepoints)
+        Firing rates, dtype float32.
+        Slices without data are filled with NaN.
     neuron_ids : list[int]
         Sorted unique neuron IDs corresponding to axis 0.
     stimuli_labels : list[str]
@@ -37,16 +65,16 @@ def rows_to_matrix(
 
     Examples
     --------
-    >>> matrix, neurons, stimuli, trials = rows_to_matrix(tensor_rows)
-    >>> matrix.shape
-    (12, 5, 20)
-    >>> # Which neuron is row 0?
-    >>> neurons[0]
-    1
+    >>> tensor, neurons, stimuli, trials = rows_to_tensor(tensor_rows)
+    >>> tensor.shape
+    (12, 5, 20, 600)
+    >>> # Firing-rate timeseries for neuron 0, stimulus 0, trial 0
+    >>> tensor[0, 0, 0]
+    array([0.12, 0.45, ...], dtype=float32)
     """
     if not rows:
         raise TensorShapeError(
-            "Cannot build a tensor matrix from an empty result set. "
+            "Cannot build a tensor from an empty result set. "
             "Check your filters — no rows were returned from the database."
         )
 
@@ -58,41 +86,67 @@ def rows_to_matrix(
     s_idx = {v: i for i, v in enumerate(stimuli_labels)}
     t_idx = {v: i for i, v in enumerate(trial_ids)}
 
-    matrix = np.full(
-        (len(neuron_ids), len(stimuli_labels), len(trial_ids)),
+    # Decode one row to determine n_timepoints
+    first_blob = next(
+        (r.firing_rates for r in rows if r.firing_rates is not None), None
+    )
+    if first_blob is None:
+        raise TensorShapeError(
+            "All rows have a null firing_rates blob. "
+            "The tensor table may have been populated with the old schema."
+        )
+    n_timepoints = len(_decode_firing_rates(first_blob))
+
+    tensor = np.full(
+        (len(neuron_ids), len(stimuli_labels), len(trial_ids), n_timepoints),
         fill_value=np.nan,
-        dtype=np.float64,
+        dtype=np.float32,
     )
 
     for row in rows:
-        if row.stimuli is None or row.trial is None or row.firing_rate is None:
+        if row.stimuli is None or row.trial is None or row.firing_rates is None:
             continue
-        matrix[n_idx[row.neuron_id], s_idx[row.stimuli], t_idx[row.trial]] = (
-            row.firing_rate
-        )
+        ni = n_idx[row.neuron_id]
+        si = s_idx[row.stimuli]
+        ti = t_idx[row.trial]
+        tensor[ni, si, ti, :] = _decode_firing_rates(row.firing_rates)
 
-    return matrix, neuron_ids, stimuli_labels, trial_ids
+    return tensor, neuron_ids, stimuli_labels, trial_ids
 
 
-def matrix_to_rows(
-    matrix: np.ndarray,
+# Keep the old name as an alias so any code that imported rows_to_matrix
+# directly from this module continues to work during the migration.
+rows_to_matrix = rows_to_tensor
+
+
+# ---------------------------------------------------------------------------
+# tensor_to_rows  (was matrix_to_rows)
+# ---------------------------------------------------------------------------
+
+def tensor_to_rows(
+    tensor: np.ndarray,
     neuron_ids: Sequence[int],
     stimuli_labels: Sequence[str],
     animal_id: str,
     sorting_id: int,
 ) -> list[dict]:
     """
-    Flatten a 3-D numpy array into a list of dicts for the tensor table.
+    Flatten a 4-D numpy array into a list of dicts for the tensor table.
+
+    One row is produced per (neuron, stimuli, trial) combination.
+    The firing-rate timeseries (axis 3) is serialised to a base64-encoded
+    .npy blob and stored in the ``firing_rates`` column.
+    NaN slices (all timepoints NaN) are skipped.
 
     Parameters
     ----------
-    matrix:
-        Array of shape (n_neurons, n_stimuli, n_trials) containing firing rates.
-        NaN cells are skipped — they represent missing observations, not zero.
+    tensor:
+        Array of shape (n_neurons, n_stimuli, n_trials, n_timepoints).
+        Values are cast to float32 before serialisation.
     neuron_ids:
-        Labels for axis 0. Must have the same length as matrix.shape[0].
+        Labels for axis 0. Must match ``tensor.shape[0]``.
     stimuli_labels:
-        Labels for axis 1. Must have the same length as matrix.shape[1].
+        Labels for axis 1. Must match ``tensor.shape[1]``.
     animal_id:
         FK to the animal table, written to every row.
     sorting_id:
@@ -101,36 +155,38 @@ def matrix_to_rows(
     Returns
     -------
     list[dict]
-        Flat list of row dicts ready for insertion into the tensor table.
+        Flat list of row dicts ready for batch insertion into the tensor table.
         Trial numbers are 0-based indices along axis 2.
 
     Raises
     ------
     TensorShapeError
-        If the array is not 3-D or the label lengths do not match.
+        If the array is not 4-D or the label lengths do not match.
 
     Examples
     --------
-    >>> rows = matrix_to_rows(mat, [1, 2, 3], ["grating_0", "grating_90"], "m01", 5)
-    >>> len(rows)  # 3 neurons × 2 stimuli × 10 trials = 60 (minus NaN cells)
-    60
+    >>> rows = tensor_to_rows(tensor, [1, 2, 3], ["A", "B"], "m01", 5)
+    >>> len(rows)   # 3 neurons × 2 stimuli × 20 trials = 120 (minus NaN slices)
+    120
+    >>> rows[0].keys()
+    dict_keys(['neuron_id', 'stimuli', 'trial', 'firing_rates', 'animal_id', 'sorting_id'])
     """
-    if matrix.ndim != 3:
+    if tensor.ndim != 4:
         raise TensorShapeError(
-            f"Expected a 3-D array with shape (n_neurons, n_stimuli, n_trials), "
-            f"got {matrix.ndim}-D array with shape {matrix.shape!r}."
+            f"Expected a 4-D array with shape (n_neurons, n_stimuli, n_trials, n_timepoints), "
+            f"got {tensor.ndim}-D array with shape {tensor.shape!r}."
         )
 
-    n_neurons, n_stimuli, n_trials = matrix.shape
+    n_neurons, n_stimuli, n_trials, _ = tensor.shape
 
     if len(neuron_ids) != n_neurons:
         raise TensorShapeError(
-            f"neuron_ids has {len(neuron_ids)} entries but the matrix has "
+            f"neuron_ids has {len(neuron_ids)} entries but the tensor has "
             f"{n_neurons} neurons on axis 0. They must match."
         )
     if len(stimuli_labels) != n_stimuli:
         raise TensorShapeError(
-            f"stimuli_labels has {len(stimuli_labels)} entries but the matrix has "
+            f"stimuli_labels has {len(stimuli_labels)} entries but the tensor has "
             f"{n_stimuli} stimuli on axis 1. They must match."
         )
 
@@ -138,17 +194,21 @@ def matrix_to_rows(
     for ni, neuron_id in enumerate(neuron_ids):
         for si, stimuli in enumerate(stimuli_labels):
             for ti in range(n_trials):
-                value = matrix[ni, si, ti]
-                if np.isnan(value):
+                timeseries = tensor[ni, si, ti]          # shape (n_timepoints,)
+                if np.all(np.isnan(timeseries)):
                     continue
                 rows.append(
                     {
-                        "neuron_id": int(neuron_id),
-                        "stimuli": str(stimuli),
-                        "trial": ti,
-                        "firing_rate": float(value),
-                        "animal_id": animal_id,
-                        "sorting_id": sorting_id,
+                        "neuron_id":    int(neuron_id),
+                        "stimuli":      str(stimuli),
+                        "trial":        ti,
+                        "firing_rates": _encode_firing_rates(timeseries),
+                        "animal_id":    animal_id,
+                        "sorting_id":   sorting_id,
                     }
                 )
     return rows
+
+
+# Keep the old name as an alias for migration compatibility.
+matrix_to_rows = tensor_to_rows
