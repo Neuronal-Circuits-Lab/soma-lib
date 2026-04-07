@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from ._query import apply_filters
-from ._tensor import matrix_to_rows, rows_to_matrix
+from ._tensor import tensor_to_rows, rows_to_tensor
 from .exceptions import ArchiveError, AuthenticationError, RecordNotFoundError
 from .models import Animal, NeuronInfo, Recording, Sorting, SpikeTimes, Tensor
 
@@ -378,8 +378,10 @@ class ArchiveClient:
         """
         Fetch tensor rows from the database.
 
-        Each row is one (neuron, stimuli, trial) → firing_rate observation.
-        To get a 3-D numpy array use :meth:`get_tensor_matrix` instead.
+        Each row is one (neuron, stimuli, trial) combination whose full
+        firing-rate timeseries is stored as a base64-encoded blob in the
+        ``firing_rates`` column.
+        To reconstruct a 4-D numpy array use :meth:`get_tensor_matrix` instead.
 
         Parameters
         ----------
@@ -519,7 +521,11 @@ class ArchiveClient:
         filters: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, list[int], list[str], list[int]]:
         """
-        Fetch tensor rows and reconstruct a 3-D numpy array.
+        Fetch tensor rows and reconstruct a 4-D numpy array.
+
+        Each row in the database holds the full firing-rate timeseries for one
+        (neuron, stimuli, trial) combination as a base64-encoded blob.
+        This method decodes all blobs and stacks them into a single tensor.
 
         Parameters
         ----------
@@ -528,8 +534,8 @@ class ArchiveClient:
 
         Returns
         -------
-        matrix : np.ndarray, shape (n_neurons, n_stimuli, n_trials)
-            Firing rates. NaN where no data exists for a combination.
+        tensor : np.ndarray, shape (n_neurons, n_stimuli, n_trials, n_timepoints)
+            Firing rates, dtype float32. NaN where no data exists.
         neuron_ids : list[int]
             Sorted unique neuron IDs — index into axis 0.
         stimuli_labels : list[str]
@@ -539,20 +545,21 @@ class ArchiveClient:
 
         Examples
         --------
-        >>> mat, neurons, stimuli, trials = client.get_tensor_matrix(
+        >>> tensor, neurons, stimuli, trials = client.get_tensor_matrix(
         ...     {"animal_id": "mouse01", "sorting_id": 3}
         ... )
-        >>> mat.shape
-        (12, 5, 20)
-        >>> # Firing rates for first neuron across all stimuli and trials
-        >>> mat[0, :, :]
+        >>> tensor.shape
+        (12, 5, 20, 600)
+        >>> # Full firing-rate timeseries for neuron 0, stimulus 0, trial 0
+        >>> tensor[0, 0, 0]
+        array([0.12, 0.45, ...], dtype=float32)
         """
         tensor_rows = self.get_tensor(filters=filters)
-        return rows_to_matrix(tensor_rows)
+        return rows_to_tensor(tensor_rows)
 
     def upload_tensor_from_matrix(
         self,
-        matrix: np.ndarray,
+        tensor: np.ndarray,
         neuron_ids: list[int],
         stimuli_labels: list[str],
         animal_id: str,
@@ -560,22 +567,29 @@ class ArchiveClient:
         batch_size: int = 500,
     ) -> int:
         """
-        Flatten a 3-D numpy array and insert its rows into the tensor table.
+        Serialise a 4-D numpy array and insert one row per (neuron, stimuli, trial)
+        into the tensor table.
+
+        The firing-rate timeseries (axis 3) is encoded as a base64 .npy blob and
+        stored in the ``firing_rates`` column, so each DB row represents a full
+        trial curve rather than a single scalar value.
 
         Parameters
         ----------
-        matrix : np.ndarray, shape (n_neurons, n_stimuli, n_trials)
-            Firing rates. NaN cells are skipped (not inserted).
+        tensor : np.ndarray, shape (n_neurons, n_stimuli, n_trials, n_timepoints)
+            Firing rates. Slices where all timepoints are NaN are skipped.
+            Values are cast to float32 before serialisation.
         neuron_ids : list[int]
-            Labels for axis 0. Must match neurons in neuron_info.
+            Labels for axis 0. Must match ``tensor.shape[0]``.
         stimuli_labels : list[str]
-            Labels for axis 1.
+            Labels for axis 1. Must match ``tensor.shape[1]``.
         animal_id : str
             FK to the animal table. Written to every inserted row.
         sorting_id : int
             FK to the sorting table. Written to every inserted row.
         batch_size : int, default 500
-            Number of rows per Supabase request. Keeps payloads under 1 MB.
+            Number of rows per Supabase request.
+            Each row is ~few KB, so 500 rows ≈ a few MB per request.
 
         Returns
         -------
@@ -585,18 +599,19 @@ class ArchiveClient:
         Examples
         --------
         >>> import numpy as np
-        >>> mat = np.random.rand(10, 4, 20)  # 10 neurons, 4 stimuli, 20 trials
+        >>> # 10 neurons, 4 stimuli, 20 trials, 600 timepoints
+        >>> t = np.random.rand(10, 4, 20, 600).astype(np.float32)
         >>> n_inserted = client.upload_tensor_from_matrix(
-        ...     mat,
+        ...     t,
         ...     neuron_ids=list(range(10)),
-        ...     stimuli_labels=["grating_0", "grating_45", "grating_90", "grating_135"],
+        ...     stimuli_labels=["A", "B", "Bc", "M"],
         ...     animal_id="mouse01",
         ...     sorting_id=3,
         ... )
         >>> print(f"Inserted {n_inserted} rows")
-        Inserted 800 rows
+        Inserted 800 rows   # 10 × 4 × 20 — vs 480 000 rows in the old schema
         """
-        rows = matrix_to_rows(matrix, neuron_ids, stimuli_labels, animal_id, sorting_id)
+        rows = tensor_to_rows(tensor, neuron_ids, stimuli_labels, animal_id, sorting_id)
         inserted = 0
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
