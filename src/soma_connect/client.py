@@ -403,6 +403,42 @@ class ArchiveClient:
             raise ArchiveError("Insert succeeded but the database returned no data.")
         return Tensor.model_validate(rows[0])
 
+    def insert_many_tensor(
+        self,
+        data: list[dict[str, Any]],
+        batch_size: int = 500,
+    ) -> int:
+        """
+        Insert multiple tensor rows in batches and return the total count inserted.
+
+        Parameters
+        ----------
+        data : list[dict]
+            List of row dicts, each containing at minimum ``neuron_id``,
+            ``stimuli``, ``trial``, ``firing_rates``, ``animal_id``, and
+            ``sorting_id``.
+        batch_size : int, default 500
+            Number of rows per Supabase request.
+
+        Returns
+        -------
+        int
+            Total number of rows inserted.
+
+        Examples
+        --------
+        >>> rows = tensor_to_rows(tensor, neuron_ids, stimuli_labels, "mouse01", 3)
+        >>> n = client.insert_many_tensor(rows)
+        >>> print(f"Inserted {n} rows")
+        Inserted 800 rows
+        """
+        inserted = 0
+        for i in range(0, len(data), batch_size):
+            batch = data[i : i + batch_size]
+            self._execute(self._client.table("tensor").insert(batch))
+            inserted += len(batch)
+        return inserted
+
     def update_tensor(self, id: int, data: dict[str, Any]) -> Tensor:
         """Update a tensor row by id and return the updated Tensor."""
         rows = self._execute(
